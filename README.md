@@ -6,7 +6,7 @@ A private photo gallery service for client jobs, separate from the public portfo
 
 Use **Cloudflare R2 Standard** for the photos and a **Cloudflare Worker** for authentication and delivery. Render's persistent disks require a paid service and keep their monthly cost while the disk is attached. Render's free service has ephemeral storage and is not recommended for production; it also spins down and can charge for outbound bandwidth. R2 keeps the images independent from app deploys and charges by storage and requests. The published R2 free tier includes 10 GB-month of Standard storage, 1 million Class A operations, 10 million Class B operations, and free internet egress. Above the free storage allowance, Standard storage is $0.015/GB-month; delete a finished job to stop accruing storage. A 10 GiB job may be slightly above the 10 GB free allowance depending on how the provider measures the stored bytes.
 
-Cloudflare Workers Free includes 100,000 requests/day but limits CPU to 10 ms/invocation. Password verification uses PBKDF2 (310,000 iterations), so deploy this gallery on the Workers Paid plan for reliable authentication. Workers Paid currently has a $5/month minimum with included request and CPU allowances. You can keep the Worker on the free plan while there are no galleries only if its CPU limit works for your account; the reliable production setting is the paid plan for the month a gallery is active, then remove the Worker or return the account to Free after the job. Confirm current pricing before enabling billing.
+Cloudflare Workers Free includes 100,000 requests/day but limits CPU to 10 ms/invocation. Password verification uses PBKDF2 (310,000 iterations), which may exceed that CPU budget, so use the Workers Paid plan for reliable authentication. Workers Paid currently has a $5/month minimum with included request and CPU allowances. If you enable it for a job, downgrade the Workers subscription to Free before the next renewal once the gallery is gone. Downgrades take effect at the end of the current billing period; the $5 is not prorated. Confirm current pricing and billing dates before enabling it.
 
 Current provider references: [R2 pricing](https://developers.cloudflare.com/r2/pricing/), [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/), [Render free service limits](https://render.com/docs/free), [Render persistent disks](https://render.com/docs/disks).
 
@@ -51,7 +51,7 @@ In the bucket's R2 API settings, create credentials and fill in `.env`. Then run
 npm run gallery -- upload wedding-2026 /path/to/final-web-sized-images
 ```
 
-The tool accepts JPG, PNG, WebP, and AVIF files directly inside the folder, skips nested folders and other files, and refuses galleries above 10 GiB. It asks for a display title and a password; press Enter at the password prompt to generate a strong random password. The script uploads photos first and publishes the password verifier last, so a partly uploaded gallery is not exposed. Give the client the printed URL and password using your normal private channel.
+The tool accepts JPG, PNG, WebP, and AVIF files directly inside the folder, skips nested folders and other files, and refuses galleries above 10 GiB. It asks for a display title and a password; press Enter at the password prompt to generate a strong random password. The script uploads photos first and publishes the password verifier last, so a partly uploaded gallery is not exposed. Give the client the printed URL and password using your normal private channel. With no other R2 usage, a 10 GiB job is about 0.74 GB above the 10 GB-month free allowance, or roughly $0.01 for a full month; a shorter job is prorated by stored days.
 
 Use web-sized/preview-resolution JPEGs appropriate for client selection and delivery. Avoid uploading camera originals unless you intend clients to download those full-size files.
 
@@ -63,7 +63,7 @@ After the client has downloaded everything, run:
 npm run gallery -- delete wedding-2026
 ```
 
-The script requires typing the exact slug, then deletes every object under that job prefix. R2 object deletion is free. The app code and empty bucket can remain; storage charges stop once the objects are deleted. Keep your normal offline/archive backup before deletion if you may need to restore the job later.
+The script requires typing the exact slug, then deletes every object under that job prefix. R2 object deletion is free. The app code and empty bucket can remain; storage charges stop once the objects are deleted. Keep your normal offline/archive backup before deletion if you may need to restore the job later. Downgrade the Workers subscription to Free before its next billing date if you do not need the paid plan for another gallery; the subscription downgrade takes effect at the billing-period boundary.
 
 ## Security and behavior
 

@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { createHash, pbkdf2Sync, randomBytes } from "node:crypto";
+import { pbkdf2Sync, randomBytes } from "node:crypto";
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -65,7 +65,6 @@ async function uploadGallery(jobSlug, sourceDirectory) {
   }
   if (totalBytes > MAX_BYTES) throw new Error(`This gallery is ${(totalBytes / 1024 ** 3).toFixed(2)} GiB. The configured per-job limit is 10 GiB.`);
 
-  const manifestKey = `${PREFIX}${jobSlug}/manifest.json`;
   const existing = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: `${PREFIX}${jobSlug}/`, MaxKeys: 1 }));
   if (existing.Contents?.length) throw new Error(`Gallery ${jobSlug} already exists. Delete it first if you intend to replace it.`);
 
