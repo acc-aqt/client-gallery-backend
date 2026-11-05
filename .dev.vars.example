@@ -1,0 +1,2 @@
+# Generate with: openssl rand -hex 32
+SESSION_SECRET=replace-with-random-64-character-hex-secret
