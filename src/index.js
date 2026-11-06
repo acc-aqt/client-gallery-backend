@@ -192,6 +192,9 @@ async function listImages(env, folderId, manifestId = null) {
       name: file.name,
       mimeType: file.mimeType,
       size: file.size,
+      previewId: file.previewId || null,
+      previewMimeType: file.previewMimeType || null,
+      previewSize: file.previewSize || null,
       imageMediaMetadata: file.width && file.height ? { width: file.width, height: file.height } : null
     }));
   }
@@ -253,7 +256,12 @@ async function getCheckedImage(env, folderId, fileId, manifestId = null) {
   if (!isDisplayImage(file)) return null;
   if (manifestEntry && file.mimeType !== manifestEntry.mimeType) return null;
   if (!manifestEntry && !(await isGalleryDescendant(env, file.parents || [], folderId))) return null;
-  if (manifestEntry) file.name = manifestEntry.name;
+  if (manifestEntry) {
+    file.name = manifestEntry.name;
+    file.previewId = manifestEntry.previewId || null;
+    file.previewMimeType = manifestEntry.previewMimeType || null;
+    file.previewSize = manifestEntry.previewSize || null;
+  }
   return file;
 }
 
@@ -277,6 +285,14 @@ async function isGalleryDescendant(env, initialParents, folderId) {
 async function serveImage(env, session, type, fileId) {
   const file = await getCheckedImage(env, session.folderId, fileId, session.manifestId);
   if (!file) return new Response("Not found", { status: 404, headers: noStore() });
+  if (type === "thumb" && file.previewId && /^[\w-]{10,200}$/.test(file.previewId)) {
+    const preview = await driveRequest(env, `files/${encodeURIComponent(file.previewId)}`, { params: { alt: "media", supportsAllDrives: "true" } });
+    if (preview.ok && preview.body) {
+      const headers = { ...noStore(), "Content-Type": file.previewMimeType === "image/webp" ? "image/webp" : "image/jpeg" };
+      if (file.previewSize) headers["Content-Length"] = file.previewSize;
+      return new Response(preview.body, { headers });
+    }
+  }
   if (type === "thumb" && file.thumbnailLink) {
     const token = await getAccessToken(env);
     const thumb = await fetch(file.thumbnailLink, { headers: { Authorization: `Bearer ${token}` }, redirect: "follow" });

@@ -7,6 +7,7 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { google } from "googleapis";
+import sharp from "sharp";
 
 const MAX_BYTES = 10 * 1024 ** 3;
 const SUPPORTED = new Set([".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif"]);
@@ -15,10 +16,10 @@ const args = process.argv.slice(2);
 const [command, slug, directory] = args;
 
 function help() {
-  console.log(`Usage:\n  npm run gallery -- import <job-slug>\n  npm run gallery -- edit <job-slug>\n  npm run gallery -- upload <job-slug> <folder-with-images>\n  npm run gallery -- delete <job-slug>\n\n"import" opens Google Drive Picker so you can select existing Drive photos without copying them.\n"edit" lets you remove listed photos and/or add more Drive photos to a Picker-linked gallery.\nJob slugs use lowercase letters, numbers, and hyphens, for example: wedding-2026.`);
+  console.log(`Usage:\n  npm run gallery -- import <job-slug>\n  npm run gallery -- edit <job-slug>\n  npm run gallery -- refresh-previews <job-slug>\n  npm run gallery -- upload <job-slug> <folder-with-images>\n  npm run gallery -- delete <job-slug>\n\n"import" opens Google Drive Picker so you can select existing Drive photos without copying them.\n"edit" lets you remove listed photos and/or add more Drive photos to a Picker-linked gallery.\n"refresh-previews" creates sharper, compressed gallery previews for an existing Picker-linked gallery.\nJob slugs use lowercase letters, numbers, and hyphens, for example: wedding-2026.`);
 }
 if (!command || command === "--help" || command === "help") { help(); process.exit(0); }
-if (!["import", "edit", "upload", "delete"].includes(command) || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug || "")) {
+if (!["import", "edit", "refresh-previews", "upload", "delete"].includes(command) || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug || "")) {
   help(); process.exit(2);
 }
 
@@ -35,6 +36,7 @@ const drive = google.drive({ version: "v3", auth });
 
 if (command === "import") await importGallery(slug);
 else if (command === "edit") await editGallery(slug);
+else if (command === "refresh-previews") await refreshGalleryPreviews(slug);
 else if (command === "upload") await uploadGallery(slug, directory);
 else await deleteGallery(slug);
 
@@ -59,7 +61,21 @@ async function importGallery(jobSlug) {
   });
   const folderId = createdFolder.data.id;
   let manifestId;
+  const createdPreviewIds = [];
+  let previewBytes = 0n;
   try {
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      const preview = await createPreviewFile(pickerDrive, file.id, folderId);
+      file.previewId = preview.id;
+      file.previewSize = preview.size;
+      createdPreviewIds.push(preview.id);
+      previewBytes += BigInt(preview.size || 0);
+      if (totalBytes + previewBytes > BigInt(MAX_BYTES)) {
+        throw new Error(`Originals plus previews exceed the 10 GiB gallery limit. No gallery was created.`);
+      }
+      console.log(`Prepared gallery preview ${index + 1}/${files.length}: ${file.name}`);
+    }
     const manifest = files.map(manifestEntry);
     const manifestFile = await pickerDrive.files.create({
       requestBody: { name: "gallery-manifest.json", mimeType: "application/json", parents: [folderId] },
@@ -78,13 +94,14 @@ async function importGallery(jobSlug) {
     await pickerDrive.files.update({ fileId: folderId, requestBody: { appProperties }, fields: "id,appProperties" });
   } catch (error) {
     if (manifestId) await pickerDrive.files.delete({ fileId: manifestId }).catch(() => {});
+    for (const previewId of createdPreviewIds) await pickerDrive.files.delete({ fileId: previewId }).catch(() => {});
     await pickerDrive.files.delete({ fileId: folderId }).catch(() => {});
     throw error;
   }
   printGalleryLink(jobSlug);
   console.log(`${files.length} selected photos were linked without copying them`);
   console.log(`Password (copy it now; it is not saved in this repo): ${password}`);
-  console.log(`${files.length} photos · ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB`);
+  console.log(`${files.length} photos · ${(Number(totalBytes + previewBytes) / 1024 ** 3).toFixed(2)} GiB including previews`);
   printRefreshTokenNotice(tokens);
 }
 
@@ -161,8 +178,35 @@ function manifestEntry(file) {
     mimeType: file.mimeType,
     size: file.size || "0",
     width: file.imageMediaMetadata?.width || null,
-    height: file.imageMediaMetadata?.height || null
+    height: file.imageMediaMetadata?.height || null,
+    ...(file.previewId ? { previewId: file.previewId, previewMimeType: "image/webp", previewSize: file.previewSize || "0" } : {})
   };
+}
+
+async function createPreviewFile(driveClient, sourceFileId, galleryFolderId) {
+  const { data: source } = await driveClient.files.get(
+    { fileId: sourceFileId, alt: "media", supportsAllDrives: true },
+    { responseType: "stream" }
+  );
+  const previewStream = sharp(undefined, { limitInputPixels: 300_000_000 })
+    .rotate()
+    .resize({ width: 1800, height: 1800, fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 84, effort: 4 });
+  source.once("error", error => previewStream.destroy(error));
+  source.pipe(previewStream);
+  try {
+    const uploaded = await driveClient.files.create({
+      requestBody: { name: `preview-${sourceFileId}.webp`, mimeType: "image/webp", parents: [galleryFolderId] },
+      media: { mimeType: "image/webp", body: previewStream },
+      uploadType: "resumable",
+      fields: "id,size"
+    });
+    return { id: uploaded.data.id, size: uploaded.data.size || "0" };
+  } catch (error) {
+    source.destroy(error);
+    previewStream.destroy(error);
+    throw error;
+  }
 }
 
 function assignUniqueGalleryNames(files, existingNames = []) {
@@ -202,25 +246,85 @@ async function editGallery(jobSlug) {
 
   const removeIndexes = parsePhotoIndexes(removeAnswer, manifest.length);
   let updated = manifest.filter((_, index) => !removeIndexes.has(index));
+  const removedEntries = manifest.filter((_, index) => removeIndexes.has(index));
   let pickedFiles = [];
   let pickerDrive = null;
   let tokens = null;
+  const createdPreviewIds = [];
   if (/^y(es)?$/i.test(addAnswer.trim())) {
     ({ files: pickedFiles, pickerDrive, tokens } = await pickDriveFilesInBatches(updated));
-    const existingIds = new Set(updated.map(file => file.id));
     assignUniqueGalleryNames(pickedFiles, updated.map(file => file.name));
+    try {
+      for (const file of pickedFiles) {
+        const preview = await createPreviewFile(pickerDrive, file.id, gallery.id);
+        file.previewId = preview.id;
+        file.previewSize = preview.size;
+        createdPreviewIds.push(preview.id);
+        console.log(`Prepared gallery preview: ${file.galleryName}`);
+      }
+    } catch (error) {
+      for (const previewId of createdPreviewIds) await pickerDrive.files.delete({ fileId: previewId }).catch(() => {});
+      throw error;
+    }
     updated = [...updated, ...pickedFiles.map(manifestEntry)];
   }
   if (removeIndexes.size === 0 && pickedFiles.length === 0) throw new Error("No gallery changes were selected.");
   if (!updated.length) throw new Error("A gallery must contain at least one photo; nothing was changed.");
-  const totalBytes = updated.reduce((sum, file) => sum + BigInt(file.size || 0), 0n);
-  if (totalBytes > BigInt(MAX_BYTES)) throw new Error(`This gallery would be ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB. The configured per-job limit is 10 GiB; nothing was changed.`);
+  const totalBytes = updated.reduce((sum, file) => sum + BigInt(file.size || 0) + BigInt(file.previewSize || 0), 0n);
+  if (totalBytes > BigInt(MAX_BYTES)) {
+    for (const previewId of createdPreviewIds) await (pickerDrive || drive).files.delete({ fileId: previewId }).catch(() => {});
+    throw new Error(`This gallery would be ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB including previews. The configured per-job limit is 10 GiB; nothing was changed.`);
+  }
 
-  await writeDriveManifest(manifestId, updated, pickerDrive || drive);
+  try {
+    await writeDriveManifest(manifestId, updated, pickerDrive || drive);
+  } catch (error) {
+    for (const previewId of createdPreviewIds) await (pickerDrive || drive).files.delete({ fileId: previewId }).catch(() => {});
+    throw error;
+  }
+  for (const file of removedEntries) {
+    if (file.previewId) await (pickerDrive || drive).files.delete({ fileId: file.previewId }).catch(() => {});
+  }
   console.log(`\nUpdated ${jobSlug}: removed ${removeIndexes.size}, added ${pickedFiles.length}, now ${updated.length} photos · ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB.`);
   if (removeIndexes.size) console.log("Removed photos are unlinked from the gallery; the original files remain in Google Drive.");
   printGalleryLink(jobSlug);
   if (tokens) printRefreshTokenNotice(tokens);
+}
+
+async function refreshGalleryPreviews(jobSlug) {
+  const gallery = await findGallery(jobSlug);
+  if (!gallery) throw new Error(`Gallery ${jobSlug} was not found in the connected Google Drive.`);
+  const props = gallery.appProperties || {};
+  const manifestId = props.clientGalleryManifestId;
+  if (!manifestId || props.clientGallerySource !== "picked-files") {
+    throw new Error("Preview refresh is available for galleries created with the Drive Picker import command.");
+  }
+  const manifest = await readDriveManifest(manifestId);
+  const missing = manifest.filter(file => !file.previewId);
+  if (!missing.length) {
+    console.log(`All ${manifest.length} photos in ${jobSlug} already have high-quality previews.`);
+    return;
+  }
+  const createdPreviewIds = [];
+  try {
+    for (let index = 0; index < missing.length; index++) {
+      const file = missing[index];
+      const preview = await createPreviewFile(drive, file.id, gallery.id);
+      file.previewId = preview.id;
+      file.previewMimeType = "image/webp";
+      file.previewSize = preview.size;
+      createdPreviewIds.push(preview.id);
+      console.log(`Prepared gallery preview ${index + 1}/${missing.length}: ${file.name}`);
+    }
+    const totalBytes = manifest.reduce((sum, file) => sum + BigInt(file.size || 0) + BigInt(file.previewSize || 0), 0n);
+    if (totalBytes > BigInt(MAX_BYTES)) throw new Error(`Originals plus previews exceed the 10 GiB gallery limit; no manifest changes were saved.`);
+    await writeDriveManifest(manifestId, manifest, drive);
+  } catch (error) {
+    for (const previewId of createdPreviewIds) await drive.files.delete({ fileId: previewId }).catch(() => {});
+    throw error;
+  }
+  console.log(`\nCreated ${missing.length} sharper previews for ${jobSlug}. The original photos are unchanged.`);
+  printGalleryLink(jobSlug);
 }
 
 function parsePhotoIndexes(value, count) {
@@ -360,6 +464,9 @@ async function uploadGallery(jobSlug, sourceDirectory) {
   });
   const folderId = created.data.id;
   const uploaded = [];
+  const previewIds = [];
+  let manifestId;
+  let previewBytes = 0;
   try {
     for (let index = 0; index < files.length; index++) {
       const file = files[index];
@@ -367,29 +474,59 @@ async function uploadGallery(jobSlug, sourceDirectory) {
         requestBody: { name: file.name, parents: [folderId] },
         media: { mimeType: file.type, body: createReadStream(file.filePath) },
         uploadType: "resumable",
-        fields: "id,name"
+        fields: "id,name,size"
       });
-      uploaded.push(result.data.id);
+      file.id = result.data.id;
+      uploaded.push(file.id);
+      const preview = await createPreviewFile(drive, file.id, folderId);
+      file.previewId = preview.id;
+      file.previewSize = preview.size;
+      previewIds.push(preview.id);
+      previewBytes += Number(preview.size || 0);
+      if (totalBytes + previewBytes > MAX_BYTES) {
+        throw new Error("Originals plus previews exceed the 10 GiB gallery limit. No gallery was created.");
+      }
       console.log(`Uploaded ${index + 1}/${files.length}: ${file.name}`);
     }
+    const manifest = files.map(file => ({
+      id: file.id,
+      name: file.name,
+      mimeType: file.type,
+      size: String(file.size),
+      width: null,
+      height: null,
+      previewId: file.previewId,
+      previewMimeType: "image/webp",
+      previewSize: file.previewSize || "0"
+    }));
+    const manifestFile = await drive.files.create({
+      requestBody: { name: "gallery-manifest.json", mimeType: "application/json", parents: [folderId] },
+      media: { mimeType: "application/json", body: JSON.stringify(manifest) },
+      fields: "id"
+    });
+    manifestId = manifestFile.data.id;
     await drive.files.update({
       fileId: folderId,
       requestBody: { appProperties: {
         clientGallerySlug: jobSlug,
         clientGalleryTitle: title,
         clientGalleryPasswordSalt: salt.toString("hex"),
-        clientGalleryPasswordHash: passwordHash
+        clientGalleryPasswordHash: passwordHash,
+        clientGallerySource: "uploaded",
+        clientGalleryManifestId: manifestId
       } },
       fields: "id,appProperties"
     });
   } catch (error) {
+    if (manifestId) await drive.files.delete({ fileId: manifestId }).catch(() => {});
+    for (const fileId of previewIds) await drive.files.delete({ fileId }).catch(() => {});
     for (const fileId of uploaded) await drive.files.delete({ fileId }).catch(() => {});
     await drive.files.delete({ fileId: folderId }).catch(() => {});
     throw error;
   }
   console.log(`\nClient gallery: https://www.carrels.photography/client-gallery/?slug=${jobSlug}`);
   console.log(`Password (copy it now; it is not saved in this repo): ${password}`);
-  console.log(`${files.length} photos · ${(totalBytes / 1024 ** 3).toFixed(2)} GiB`);
+  console.log(`${files.length} photos · ${((totalBytes + previewBytes) / 1024 ** 3).toFixed(2)} GiB including previews`);
 }
 
 async function findGallery(jobSlug) {

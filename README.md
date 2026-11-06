@@ -2,7 +2,7 @@
 
 This is the separate Node.js backend for the static client gallery pages in the `carrels-photography.github.io` repository. Client galleries use the same warm colors, navigation, masonry layout, and lightbox as the main portfolio. Clients can download one photograph or the complete gallery as a ZIP.
 
-The photos stay private in Google Drive. This service checks gallery passwords, refreshes your Google OAuth access token, and streams authorized images and ZIP downloads to the static site. It does not publish Drive links or keep a second image copy on the server. Each gallery is limited to 10 GiB.
+The original photos stay private in Google Drive. This service checks gallery passwords, refreshes your Google OAuth access token, and streams authorized images and ZIP downloads to the static site. Galleries store compressed WebP previews in the app-managed Drive folder so the grid stays sharp without loading full-resolution originals. For Picker-linked galleries, originals are never copied. The 10 GiB gallery limit includes previews.
 
 ## How the two repos fit together
 
@@ -59,7 +59,7 @@ To link existing photos from Drive:
 npm run gallery -- import wedding-2026
 ```
 
-The command opens Google Picker filtered to supported image types, with multi-select enabled. Open the job folder and, on Mac, try **Command+A** to select all visible images in that batch, then confirm. If the Picker limits a selection to 100 files, the importer asks whether to choose another batch; repeat until all photos are included, then answer `N`. It combines the batches, skips files already selected, and applies the 10 GiB limit to the whole gallery. Each batch opens another Picker authorization flow. Enter a title and password after the final batch, or press Enter to generate a strong password. The script records selected file IDs in a private Drive manifest and does not copy or move the source photos.
+The command opens Google Picker filtered to supported image types, with multi-select enabled. Open the job folder and, on Mac, try **Command+A** to select all visible images in that batch, then confirm. If the Picker limits a selection to 100 files, the importer asks whether to choose another batch; repeat until all photos are included, then answer `N`. It combines the batches, skips files already selected, and applies the 10 GiB limit to the originals and previews together. Each batch opens another Picker authorization flow. Enter a title and password after the final batch, or press Enter to generate a strong password. The script records selected file IDs in a private Drive manifest, creates small compressed previews in an app-managed Drive folder, and leaves the source photos untouched.
 
 Selecting a folder itself does not automatically grant the app access to all its child photos under the current narrow `drive.file` scope; this matches the empty-folder result seen in testing. Automatically enumerating folder contents would need a broader scope such as `drive.readonly`. Google classifies that scope as restricted and requires verification, including an annual security assessment for restricted-scope apps, so the importer keeps the narrower Picker based flow. See [Google Drive scope definitions](https://developers.google.com/workspace/drive/api/guides/api-specific-auth) and [restricted-scope requirements](https://support.google.com/cloud/answer/13464321).
 
@@ -71,7 +71,15 @@ To change a Picker-linked gallery later, run:
 npm run gallery -- edit wedding-2026
 ```
 
-The command lists the current photos by number. Enter numbers or ranges to remove (for example `2,4-6`), then choose whether to add more photos through Picker. You can add multiple batches if the Picker limits each selection. Removing photos only removes them from the gallery manifest; the original Drive files stay untouched. The gallery title and password remain the same. This edit command currently works with galleries made by the `import` command.
+The command lists the current photos by number. Enter numbers or ranges to remove (for example `2,4-6`), then choose whether to add more photos through Picker. You can add multiple batches if the Picker limits each selection. New photos get compressed previews; removing a photo deletes only its generated preview and unlinks the original from the gallery. The original Drive photo stays untouched. The gallery title and password remain the same. This edit command currently works with galleries made by the `import` command.
+
+For an existing Picker-linked gallery created before previews were added, generate them once with:
+
+```sh
+npm run gallery -- refresh-previews wedding-2026
+```
+
+This adds compressed WebP previews in the app-managed Drive folder and updates the gallery manifest. It does not change the original photos.
 
 To upload a local folder of final images into Drive instead:
 
@@ -79,7 +87,7 @@ To upload a local folder of final images into Drive instead:
 npm run gallery -- upload wedding-2026 /path/to/final-images
 ```
 
-Supported formats are JPG, PNG, WebP, AVIF, and GIF. The importer only reads files directly inside the chosen folder; nested items are skipped.
+Supported formats are JPG, PNG, WebP, AVIF, and GIF. The importer only reads files directly inside the chosen folder; nested items are skipped. It saves the uploaded photos and their compressed previews in a Drive manifest-backed gallery, with both counted toward the 10 GiB limit.
 
 After the client has finished downloading, remove the gallery record:
 
