@@ -3,16 +3,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "gallery": "node scripts/gallery.mjs"
+    "start": "node src/index.js",
+    "dev": "node src/index.js",
+    "gallery": "node scripts/gallery.mjs",
+    "google-auth": "node scripts/google-auth.mjs"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.880.0",
+    "@zip.js/zip.js": "^2.24.0",
     "dotenv": "^16.4.7",
-    "fflate": "^0.8.2"
-  },
-  "devDependencies": {
-    "wrangler": "^4.28.1"
+    "googleapis": "^150.0.0"
   }
 }

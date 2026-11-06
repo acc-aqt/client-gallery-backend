@@ -1,55 +1,191 @@
 import "dotenv/config";
 import { pbkdf2Sync, randomBytes } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { createServer } from "node:http";
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import {
-  DeleteObjectsCommand,
-  ListObjectsV2Command,
-  PutObjectCommand,
-  S3Client,
-} from "@aws-sdk/client-s3";
+import { google } from "googleapis";
 
-const PREFIX = "galleries/";
 const MAX_BYTES = 10 * 1024 ** 3;
-const SUPPORTED = new Set([".jpg", ".jpeg", ".png", ".webp", ".avif"]);
-const MIME = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".avif": "image/avif" };
+const SUPPORTED = new Set([".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif"]);
+const MIME = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".avif": "image/avif", ".gif": "image/gif" };
 const args = process.argv.slice(2);
 const [command, slug, directory] = args;
 
 function help() {
-  console.log(`Usage:\n  npm run gallery -- upload <job-slug> <folder-with-images>\n  npm run gallery -- delete <job-slug>\n\nJob slugs use lowercase letters, numbers, and hyphens, for example: wedding-2026.`);
+  console.log(`Usage:\n  npm run gallery -- import <job-slug>\n  npm run gallery -- upload <job-slug> <folder-with-images>\n  npm run gallery -- delete <job-slug>\n\n"import" opens Google Drive Picker so you can select existing Drive photos without copying them.\nJob slugs use lowercase letters, numbers, and hyphens, for example: wedding-2026.`);
 }
 if (!command || command === "--help" || command === "help") { help(); process.exit(0); }
-if (!["upload", "delete"].includes(command) || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug || "")) {
+if (!["import", "upload", "delete"].includes(command) || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug || "")) {
   help(); process.exit(2);
 }
 
-const bucket = process.env.R2_BUCKET_NAME || "carrels-client-galleries";
-const accountId = process.env.R2_ACCOUNT_ID;
-const accessKeyId = process.env.R2_ACCESS_KEY_ID;
-const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
-if (!accountId || !accessKeyId || !secretAccessKey) {
-  console.error("Set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY in a local .env file first.");
+const clientId = process.env.GOOGLE_CLIENT_ID;
+const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+if (!clientId || !clientSecret || !refreshToken) {
+  console.error("Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN in .env first.");
   process.exit(2);
 }
-const s3 = new S3Client({
-  region: "auto",
-  endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
-  credentials: { accessKeyId, secretAccessKey },
-  forcePathStyle: true,
-});
+const auth = new google.auth.OAuth2(clientId, clientSecret);
+auth.setCredentials({ refresh_token: refreshToken });
+const drive = google.drive({ version: "v3", auth });
 
-if (command === "upload") await uploadGallery(slug, directory);
+if (command === "import") await importGallery(slug);
+else if (command === "upload") await uploadGallery(slug, directory);
 else await deleteGallery(slug);
+
+async function importGallery(jobSlug) {
+  if (await findGallery(jobSlug)) throw new Error(`Gallery ${jobSlug} already exists. Delete it first if you intend to replace it.`);
+  const redirectUri = "http://localhost:53682/oauth2callback";
+  const pickerAuth = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  const authUrl = pickerAuth.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: ["https://www.googleapis.com/auth/drive.file"],
+    trigger_onepick: "true",
+    allow_multiple: "true"
+  });
+  const result = await waitForDrivePicker(redirectUri, authUrl);
+  const tokens = (await pickerAuth.getToken(result.code)).tokens;
+  pickerAuth.setCredentials(tokens);
+  const pickerDrive = google.drive({ version: "v3", auth: pickerAuth });
+  const existing = await pickerDrive.files.list({
+    q: `mimeType = 'application/vnd.google-apps.folder' and trashed = false and appProperties has { key='clientGallerySlug' and value='${jobSlug}' }`,
+    pageSize: 1,
+    fields: "files(id,name)"
+  });
+  if (existing.data.files?.length) throw new Error(`Gallery ${jobSlug} already exists. Delete it first if you intend to replace it.`);
+  const files = [];
+  for (const fileId of [...new Set(result.pickedFileIds)]) {
+    const { data: file } = await pickerDrive.files.get({
+      fileId,
+      supportsAllDrives: true,
+      fields: "id,name,mimeType,size,trashed,driveId,imageMediaMetadata(width,height)"
+    });
+    if (file.trashed || !["image/jpeg", "image/png", "image/webp", "image/avif", "image/gif"].includes(file.mimeType)) {
+      throw new Error(`“${file.name}” is not an active supported photo. Pick JPG, PNG, WebP, AVIF, or GIF images only.`);
+    }
+    files.push(file);
+  }
+  if (!files.length) throw new Error("No photos were selected. Open the Drive folder, select the images, and confirm the selection.");
+  const usedNames = new Set();
+  for (const file of files) {
+    const dot = file.name.lastIndexOf(".");
+    const stem = dot > 0 ? file.name.slice(0, dot) : file.name;
+    const extension = dot > 0 ? file.name.slice(dot) : "";
+    let candidate = file.name;
+    let duplicate = 2;
+    while (usedNames.has(candidate.toLocaleLowerCase())) candidate = `${stem} (${duplicate++})${extension}`;
+    usedNames.add(candidate.toLocaleLowerCase());
+    file.galleryName = candidate;
+  }
+  const totalBytes = files.reduce((sum, file) => sum + BigInt(file.size || 0), 0n);
+  if (totalBytes > BigInt(MAX_BYTES)) throw new Error(`This gallery is ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB. The configured per-job limit is 10 GiB.`);
+
+  const { title, password, salt, passwordHash } = await promptGalleryDetails(jobSlug, jobSlug.replaceAll("-", " "));
+  const createdFolder = await pickerDrive.files.create({
+    requestBody: { name: `Carrels client gallery ${jobSlug}`, mimeType: "application/vnd.google-apps.folder" },
+    fields: "id,name"
+  });
+  const folderId = createdFolder.data.id;
+  let manifestId;
+  try {
+    const manifest = files.map(file => ({
+      id: file.id,
+      name: file.galleryName,
+      mimeType: file.mimeType,
+      size: file.size || "0",
+      width: file.imageMediaMetadata?.width || null,
+      height: file.imageMediaMetadata?.height || null
+    }));
+    const manifestFile = await pickerDrive.files.create({
+      requestBody: { name: "gallery-manifest.json", mimeType: "application/json", parents: [folderId] },
+      media: { mimeType: "application/json", body: JSON.stringify(manifest) },
+      fields: "id"
+    });
+    manifestId = manifestFile.data.id;
+    const appProperties = {
+      clientGallerySlug: jobSlug,
+      clientGalleryTitle: title,
+      clientGalleryPasswordSalt: salt.toString("hex"),
+      clientGalleryPasswordHash: passwordHash,
+      clientGallerySource: "picked-files",
+      clientGalleryManifestId: manifestId
+    };
+    await pickerDrive.files.update({ fileId: folderId, requestBody: { appProperties }, fields: "id,appProperties" });
+  } catch (error) {
+    if (manifestId) await pickerDrive.files.delete({ fileId: manifestId }).catch(() => {});
+    await pickerDrive.files.delete({ fileId: folderId }).catch(() => {});
+    throw error;
+  }
+  console.log(`\nClient gallery: https://www.carrels.photography/client-gallery/?slug=${jobSlug}`);
+  console.log(`${files.length} selected photos were linked without copying them`);
+  console.log(`Password (copy it now; it is not saved in this repo): ${password}`);
+  console.log(`${files.length} photos · ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB`);
+  if (tokens.refresh_token && tokens.refresh_token !== refreshToken) {
+    console.log("Google issued a new refresh token. Update GOOGLE_REFRESH_TOKEN in your private .env and Render environment settings if deployed.");
+    console.log(tokens.refresh_token);
+  }
+}
+
+function waitForDrivePicker(redirectUri, authUrl) {
+  return new Promise((resolve, reject) => {
+    const rl = createInterface({ input: stdin, output: stdout });
+    const server = createServer((request, response) => {
+      const url = new URL(request.url, redirectUri);
+      if (url.pathname !== "/oauth2callback") {
+        response.writeHead(404).end("Not found");
+        return;
+      }
+      const error = url.searchParams.get("error");
+      const code = url.searchParams.get("code");
+      const pickedFileIds = (url.searchParams.get("picked_file_ids") || "").split(",").filter(Boolean);
+      if (error || !code || pickedFileIds.length < 1) {
+        response.writeHead(400, { "Content-Type": "text/html; charset=utf-8" }).end("<p>No photos were selected. Return to your terminal, open the Drive folder, and select the photos.</p>");
+        server.close();
+        rl.close();
+        reject(new Error(error ? `Google Drive authorization failed: ${error}` : "No photos were selected. Open the Drive folder, select the photos, and confirm the selection."));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end("<p>Drive folder selected. Return to your terminal.</p>");
+      server.close();
+      rl.close();
+      resolve({ code, pickedFileIds });
+    });
+    server.once("error", error => { rl.close(); reject(error); });
+    server.listen(53682, "127.0.0.1", () => {
+      console.log("Google Drive Picker will open in your browser. Open the client folder, then select all photos for this gallery.");
+      console.log(`\n${authUrl}\n`);
+      console.log("If it does not open automatically, copy the URL above into your browser. Waiting for selection…");
+    });
+    rl.on("SIGINT", () => { server.close(); process.exit(130); });
+  });
+}
+
+async function promptGalleryDetails(jobSlug, folderName) {
+  const rl = createInterface({ input: stdin, output: stdout });
+  try {
+    const titleInput = await rl.question(`Gallery title [${folderName}]: `);
+    const title = titleInput.trim() || folderName;
+    let password = await rl.question("Gallery password (press Enter to generate a strong one): ");
+    if (new TextEncoder().encode(title).length > 90) throw new Error("Keep the gallery title to 90 UTF-8 bytes or fewer.");
+    if (!password) password = randomBytes(18).toString("base64url");
+    if (password.length < 12 || password.length > 256) throw new Error("Use a gallery password between 12 and 256 characters.");
+    const salt = randomBytes(16);
+    const passwordHash = pbkdf2Sync(password, salt, 310000, 32, "sha256").toString("hex");
+    return { title, password, salt, passwordHash };
+  } finally { rl.close(); }
+}
 
 async function uploadGallery(jobSlug, sourceDirectory) {
   if (!sourceDirectory) throw new Error("Provide a folder containing the finished gallery images.");
   const absoluteDir = path.resolve(sourceDirectory);
   const entries = await readdir(absoluteDir, { withFileTypes: true });
   const imageEntries = entries.filter(entry => entry.isFile() && SUPPORTED.has(path.extname(entry.name).toLowerCase()));
-  if (!imageEntries.length) throw new Error("No JPG, PNG, WebP, or AVIF images found directly in that folder.");
+  if (!imageEntries.length) throw new Error("No JPG, PNG, WebP, AVIF, or GIF images found directly in that folder.");
   if (imageEntries.length !== entries.length) {
     const ignored = entries.filter(entry => !entry.isFile() || !SUPPORTED.has(path.extname(entry.name).toLowerCase())).map(entry => entry.name);
     console.log(`Skipping ${ignored.length} non-image or nested item(s).`);
@@ -65,62 +201,101 @@ async function uploadGallery(jobSlug, sourceDirectory) {
   }
   if (totalBytes > MAX_BYTES) throw new Error(`This gallery is ${(totalBytes / 1024 ** 3).toFixed(2)} GiB. The configured per-job limit is 10 GiB.`);
 
-  const existing = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: `${PREFIX}${jobSlug}/`, MaxKeys: 1 }));
-  if (existing.Contents?.length) throw new Error(`Gallery ${jobSlug} already exists. Delete it first if you intend to replace it.`);
+  const existing = await findGallery(jobSlug);
+  if (existing) throw new Error(`Gallery ${jobSlug} already exists. Delete it first if you intend to replace it.`);
 
   const rl = createInterface({ input: stdin, output: stdout });
   const titleInput = await rl.question(`Gallery title [${jobSlug.replaceAll("-", " ")}]: `);
   const title = titleInput.trim() || jobSlug.replaceAll("-", " ");
   let password = await rl.question("Gallery password (press Enter to generate a strong one): ");
   rl.close();
+  if (new TextEncoder().encode(title).length > 90) throw new Error("Keep the gallery title to 90 UTF-8 bytes or fewer.");
   if (!password) password = randomBytes(18).toString("base64url");
   if (password.length < 12 || password.length > 256) throw new Error("Use a gallery password between 12 and 256 characters.");
 
   const salt = randomBytes(16);
-  const passwordHash = pbkdf2Sync(password, salt, 310000, 32, "sha256");
+  const passwordHash = pbkdf2Sync(password, salt, 310000, 32, "sha256").toString("hex");
+  const created = await drive.files.create({
+    requestBody: { name: title, mimeType: "application/vnd.google-apps.folder" },
+    fields: "id,name"
+  });
+  const folderId = created.data.id;
   const uploaded = [];
   try {
     for (let index = 0; index < files.length; index++) {
       const file = files[index];
-      const key = `${PREFIX}${jobSlug}/images/${file.name}`;
-      const body = await import("node:fs").then(({ createReadStream }) => createReadStream(file.filePath));
-      await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentLength: file.size, ContentType: file.type, CacheControl: "private, no-store" }));
-      uploaded.push({ Key: key });
+      const result = await drive.files.create({
+        requestBody: { name: file.name, parents: [folderId] },
+        media: { mimeType: file.type, body: createReadStream(file.filePath) },
+        uploadType: "resumable",
+        fields: "id,name"
+      });
+      uploaded.push(result.data.id);
       console.log(`Uploaded ${index + 1}/${files.length}: ${file.name}`);
     }
-    const manifest = {
-      version: 1,
-      title,
-      passwordSalt: salt.toString("hex"),
-      passwordHash: passwordHash.toString("hex"),
-      createdAt: new Date().toISOString(),
-    };
-    await s3.send(new PutObjectCommand({ Bucket: bucket, Key: manifestKey, Body: JSON.stringify(manifest), ContentType: "application/json", CacheControl: "private, no-store" }));
+    await drive.files.update({
+      fileId: folderId,
+      requestBody: { appProperties: {
+        clientGallerySlug: jobSlug,
+        clientGalleryTitle: title,
+        clientGalleryPasswordSalt: salt.toString("hex"),
+        clientGalleryPasswordHash: passwordHash
+      } },
+      fields: "id,appProperties"
+    });
   } catch (error) {
-    if (uploaded.length) await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: uploaded, Quiet: true } }));
+    for (const fileId of uploaded) await drive.files.delete({ fileId }).catch(() => {});
+    await drive.files.delete({ fileId: folderId }).catch(() => {});
     throw error;
   }
-  console.log(`\nGallery ready: https://clients.carrels.photography/${jobSlug}`);
+  console.log(`\nClient gallery: https://www.carrels.photography/client-gallery/?slug=${jobSlug}`);
   console.log(`Password (copy it now; it is not saved in this repo): ${password}`);
   console.log(`${files.length} photos · ${(totalBytes / 1024 ** 3).toFixed(2)} GiB`);
 }
 
+async function findGallery(jobSlug) {
+  const q = `mimeType = 'application/vnd.google-apps.folder' and trashed = false and appProperties has { key='clientGallerySlug' and value='${jobSlug}' }`;
+  const result = await drive.files.list({ q, pageSize: 1, fields: "files(id,name,appProperties)" });
+  return result.data.files?.[0] || null;
+}
+
 async function deleteGallery(jobSlug) {
+  const folder = await findGallery(jobSlug);
+  if (!folder) throw new Error(`Gallery ${jobSlug} was not found in the connected Google Drive.`);
   const rl = createInterface({ input: stdin, output: stdout });
-  const confirmation = await rl.question(`Type ${jobSlug} to permanently delete that gallery and its photos: `);
+  let confirmation;
+  if (folder.appProperties?.clientGallerySource === "existing") {
+    confirmation = await rl.question(`Unpublish gallery ${jobSlug} and keep the original Drive folder and photos? Type ${jobSlug}: `);
+  } else {
+    confirmation = await rl.question(`Permanently delete the Drive folder “${folder.name}” and its contents? Type ${jobSlug}: `);
+  }
   rl.close();
   if (confirmation !== jobSlug) throw new Error("The gallery slug did not match; nothing was deleted.");
-  let token;
+  if (folder.appProperties?.clientGallerySource === "existing") {
+    const appProperties = { ...folder.appProperties };
+    for (const key of ["clientGallerySlug", "clientGalleryTitle", "clientGalleryPasswordSalt", "clientGalleryPasswordHash", "clientGallerySource"]) delete appProperties[key];
+    await drive.files.update({ fileId: folder.id, requestBody: { appProperties }, fields: "id" });
+    console.log(`Gallery ${jobSlug} is unpublished. The original folder and photos remain in Google Drive.`);
+    return;
+  }
+  let pageToken;
   let deleted = 0;
   do {
-    const page = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: `${PREFIX}${jobSlug}/`, ContinuationToken: token }));
-    const objects = (page.Contents || []).map(item => ({ Key: item.Key }));
-    if (objects.length) {
-      await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects, Quiet: true } }));
-      deleted += objects.length;
-      console.log(`Deleted ${deleted} object(s)…`);
+    const page = await drive.files.list({
+      q: `'${folder.id}' in parents and trashed = false`,
+      pageSize: 1000,
+      pageToken,
+      fields: "nextPageToken,files(id,name)"
+    });
+    const children = page.data.files || [];
+    for (let offset = 0; offset < children.length; offset += 5) {
+      const batch = children.slice(offset, offset + 5);
+      await Promise.all(batch.map(file => drive.files.delete({ fileId: file.id })));
+      deleted += batch.length;
+      if (deleted % 100 === 0 || deleted === children.length) console.log(`Deleted ${deleted} file(s)…`);
     }
-    token = page.IsTruncated ? page.NextContinuationToken : undefined;
-  } while (token);
-  console.log(`Gallery ${jobSlug} deleted (${deleted} object(s)).`);
+    pageToken = page.data.nextPageToken;
+  } while (pageToken);
+  await drive.files.delete({ fileId: folder.id });
+  console.log(`Gallery ${jobSlug} permanently deleted from Google Drive (${deleted} photos).`);
 }

@@ -1,76 +1,98 @@
 # Carrels client galleries
 
-A private photo gallery service for client jobs, separate from the public portfolio. The gallery page uses a dark, minimal photo grid with a lightbox, individual downloads, and a **Download all images** ZIP. Each gallery has its own password. Photos stay in a private Cloudflare R2 bucket; this repository contains only the application and upload tooling.
+This is the separate Node.js backend for the static client gallery pages in the `carrels-photography.github.io` repository. Client galleries use the same warm colors, navigation, masonry layout, and lightbox as the main portfolio. Clients can download one photograph or the complete gallery as a ZIP.
 
-## Storage and cost fit
+The photos stay private in Google Drive. This service checks gallery passwords, refreshes your Google OAuth access token, and streams authorized images and ZIP downloads to the static site. It does not publish Drive links or keep a second image copy on the server. Each gallery is limited to 10 GiB.
 
-Use **Cloudflare R2 Standard** for the photos and a **Cloudflare Worker** for authentication and delivery. Render's persistent disks require a paid service and keep their monthly cost while the disk is attached. Render's free service has ephemeral storage and is not recommended for production; it also spins down and can charge for outbound bandwidth. R2 keeps the images independent from app deploys and charges by storage and requests. The published R2 free tier includes 10 GB-month of Standard storage, 1 million Class A operations, 10 million Class B operations, and free internet egress. Above the free storage allowance, Standard storage is $0.015/GB-month; delete a finished job to stop accruing storage. A 10 GiB job may be slightly above the 10 GB free allowance depending on how the provider measures the stored bytes.
+## How the two repos fit together
 
-Cloudflare Workers Free includes 100,000 requests/day but limits CPU to 10 ms/invocation. Password verification uses PBKDF2 (310,000 iterations), which may exceed that CPU budget, so use the Workers Paid plan for reliable authentication. Workers Paid currently has a $5/month minimum with included request and CPU allowances. If you enable it for a job, downgrade the Workers subscription to Free before the next renewal once the gallery is gone. Downgrades take effect at the end of the current billing period; the $5 is not prorated. Confirm current pricing and billing dates before enabling it.
+- The GitHub Pages site hosts `/clients/` and `/client-gallery/?slug=...`.
+- This repo provides the JSON API and streams the photos from Drive.
+- `js/client-gallery-config.js` in the website repo points to the backend service URL. Update it if Render assigns a different URL.
+- The API accepts browser requests only from the configured website origins (`FRONTEND_ORIGINS`).
 
-Current provider references: [R2 pricing](https://developers.cloudflare.com/r2/pricing/), [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/), [Render free service limits](https://render.com/docs/free), [Render persistent disks](https://render.com/docs/disks).
+## Google Drive setup
 
-## URL and the existing portfolio
+Use the existing Google Cloud OAuth app and refresh token configured for the gallery importer. The OAuth client should be a **Web application** with `http://localhost:53682/oauth2callback` as an authorized redirect URI. Enable the Google Drive API and Google Picker API. The app uses the narrow `drive.file` scope and does not browse your whole Drive.
 
-The site is deployed on a separate hostname, for example `https://clients.carrels.photography/wedding-2026`. This keeps the public portfolio on GitHub Pages untouched. The root-domain URL pattern `carrels.photography/client-job-xy` cannot be routed to a different server while the existing root domain goes directly to GitHub Pages; that requires moving the root-domain DNS/proxy/site routing to Cloudflare. A dedicated `clients` subdomain is the low-change option. To attach it as a Worker custom domain, the domain's DNS zone must be managed in Cloudflare. Until then, the Worker can be previewed on its `workers.dev` hostname.
+Create a private local `.env` from `.env.example` and fill in:
 
-## 1. Create the private bucket
-
-1. Create a Cloudflare account and enable R2 billing. Create a **private** Standard bucket named `carrels-client-galleries`.
-2. Do not enable public `r2.dev` access or a public bucket custom domain.
-3. Create an R2 API token scoped to this bucket. The upload/delete script needs object read, write, and delete permissions. Keep the credentials out of Git.
-4. Copy `.env.example` to `.env` and fill in the R2 account ID, API key, and secret. `.env` is ignored by Git.
-
-The Worker uses an R2 binding and does not need the S3 credentials. The bucket must remain private; the Worker checks the gallery password before returning any image or ZIP.
-
-## 2. Deploy the Worker
-
-Install Node.js 20 or newer and run:
-
-```sh
-npm install
-npx wrangler login
-npx wrangler secret put SESSION_SECRET
+```dotenv
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+GOOGLE_REFRESH_TOKEN=...
+SESSION_SECRET=use-a-long-random-secret
+FRONTEND_ORIGINS=https://www.carrels.photography,https://carrels.photography,http://localhost:8000,http://127.0.0.1:8000
 ```
 
-For `SESSION_SECRET`, provide at least 32 random bytes, for example the output of `openssl rand -hex 32`. Then:
+Keep `.env` private; Git ignores it. `SESSION_SECRET` should contain at least 32 random bytes. You can create a value with `openssl rand -hex 32`.
+
+Install Node.js 20 or newer and dependencies:
 
 ```sh
-npm run deploy
+npm ci
 ```
 
-Wrangler creates/updates the Worker and binds the existing R2 bucket. In the Cloudflare dashboard, add `clients.carrels.photography` as a custom domain for this Worker. Add the corresponding DNS zone to Cloudflare if needed; do not change the existing root domain record as part of this setup.
+If you still need a refresh token, run `npm run google-auth`, approve Drive access, and save the printed refresh token in `.env`.
 
-For local preview, copy `.dev.vars.example` to `.dev.vars`, set a random `SESSION_SECRET`, then run `npm run dev`. Local preview still needs an R2 bucket binding; use a separate test bucket by changing `bucket_name` in `wrangler.jsonc` before testing.
+## Run both repos locally
 
-## 3. Upload a client job
-
-In the bucket's R2 API settings, create credentials and fill in `.env`. Then run:
+Start the API in one terminal:
 
 ```sh
-npm run gallery -- upload wedding-2026 /path/to/final-web-sized-images
+npm run dev
 ```
 
-The tool accepts JPG, PNG, WebP, and AVIF files directly inside the folder, skips nested folders and other files, and refuses galleries above 10 GiB. It asks for a display title and a password; press Enter at the password prompt to generate a strong random password. The script uploads photos first and publishes the password verifier last, so a partly uploaded gallery is not exposed. Give the client the printed URL and password using your normal private channel. With no other R2 usage, a 10 GiB job is about 0.74 GB above the 10 GB-month free allowance, or roughly $0.01 for a full month; a shorter job is prorated by stored days.
+It listens on `http://localhost:10000`. In the website repo, set `window.CLIENT_GALLERY_API` in `js/client-gallery-config.js` to `http://localhost:10000` while developing. Serve the static site from its repo root in another terminal:
 
-Use web-sized/preview-resolution JPEGs appropriate for client selection and delivery. Avoid uploading camera originals unless you intend clients to download those full-size files.
+```sh
+python3 -m http.server 8000
+```
 
-## 4. Remove the gallery
+Open `http://localhost:8000/clients/`. Add both local origins shown above to `FRONTEND_ORIGINS` (they are included in the example). Restore the Render URL in the website config before committing the website changes for publication.
 
-After the client has downloaded everything, run:
+## Create and remove galleries
+
+To link existing photos from Drive:
+
+```sh
+npm run gallery -- import wedding-2026
+```
+
+The command opens Google Picker. Select the photos (multi-select is enabled), then enter a title and password, or press Enter to generate a strong password. The script records selected file IDs in a private Drive manifest and does not copy or move the source photos. Google requires selecting the individual files because `drive.file` does not automatically expose every item in a selected folder.
+
+The command prints the website link and password. Send the link and password to the client through your usual private channel. The gallery also has a password form at `/clients/`.
+
+To upload a local folder of final images into Drive instead:
+
+```sh
+npm run gallery -- upload wedding-2026 /path/to/final-images
+```
+
+Supported formats are JPG, PNG, WebP, AVIF, and GIF. The importer only reads files directly inside the chosen folder; nested items are skipped.
+
+After the client has finished downloading, remove the gallery record:
 
 ```sh
 npm run gallery -- delete wedding-2026
 ```
 
-The script requires typing the exact slug, then deletes every object under that job prefix. R2 object deletion is free. The app code and empty bucket can remain; storage charges stop once the objects are deleted. Keep your normal offline/archive backup before deletion if you may need to restore the job later. Downgrade the Workers subscription to Free before its next billing date if you do not need the paid plan for another gallery; the subscription downgrade takes effect at the billing-period boundary.
+For linked Drive photos, this removes only the gallery's manifest and app-managed folder; the original photos remain where they are. For local uploads, it permanently deletes the uploaded Drive copies.
 
-## Security and behavior
+## Deploy this repo to Render
 
-- The R2 bucket is private; images and ZIP data are fetched only after a valid password session.
-- Password verifiers use per-gallery salts and PBKDF2-SHA-256; passwords never appear in the repo or in the gallery manifest as plaintext.
-- A signed, HttpOnly, Secure, SameSite=Strict cookie grants access to only the matching gallery for 12 hours. The gallery API, each photo, and the ZIP endpoint all check the session.
-- Responses use `no-store`, and client galleries are marked `noindex,nofollow`.
-- The ZIP is generated as a stream on demand, so the Worker does not need to store a second archive or buffer the whole job in memory.
-- This starter does not provide an owner dashboard. Use the local CLI to create/delete jobs. Rotating `SESSION_SECRET` logs out all existing sessions.
-- Password sharing cannot prevent a client from copying or redistributing downloaded images. Send a long, unique password to each job and delete the job when delivery is complete.
+1. Push this repository to its own GitHub repo.
+2. In Render, create a Blueprint from that repo. `render.yaml` defines a Node web service, `/health` check, and the required environment variables. Render prompts for the Google credentials when creating the service.
+3. Copy the deployed service URL (the default service name is `carrels-client-galleries`) and set it as `window.CLIENT_GALLERY_API` in the static website repo's `js/client-gallery-config.js`.
+4. Confirm `FRONTEND_ORIGINS` includes both `https://www.carrels.photography` and `https://carrels.photography`, then deploy the website repo to GitHub Pages.
+
+The Blueprint starts on Render's Free plan, which is suitable for trying the flow. Free web services sleep after 15 minutes without requests and can take about a minute to wake. Render notes that Free services are not intended for production; outbound bandwidth also counts toward workspace usage. Review current [Render free-service limits](https://render.com/docs/free) before sharing a production gallery. Paid Render services avoid the free-plan sleep behavior but are billed while provisioned.
+
+## Security and limits
+
+- Google OAuth credentials are server environment variables and never go to the browser.
+- Password verifiers use salted PBKDF2-SHA-256. The plaintext password is not stored.
+- A signed 12-hour session authorizes listing and image streaming. The browser keeps the token in tab-scoped session storage; tokenized media requests use no-store and no-referrer headers.
+- The site pages are marked `noindex,nofollow`.
+- Download All streams a Zip64 archive from Drive through the backend. The server does not store the archive. Clients need an archive utility that supports Zip64 for ZIP files above 4 GiB.
+- There is no admin dashboard. Use the local CLI to create and remove galleries. Removing the gallery metadata disables access immediately.
