@@ -188,7 +188,7 @@ async function createPreviewFile(driveClient, sourceFileId, galleryFolderId) {
     { fileId: sourceFileId, alt: "media", supportsAllDrives: true },
     { responseType: "stream" }
   );
-  const previewStream = sharp(undefined, { limitInputPixels: 300_000_000 })
+  const previewStream = sharp()
     .rotate()
     .resize({ width: 1800, height: 1800, fit: "inside", withoutEnlargement: true })
     .webp({ quality: 84, effort: 4 });
