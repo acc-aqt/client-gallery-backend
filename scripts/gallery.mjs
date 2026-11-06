@@ -15,10 +15,10 @@ const args = process.argv.slice(2);
 const [command, slug, directory] = args;
 
 function help() {
-  console.log(`Usage:\n  npm run gallery -- import <job-slug>\n  npm run gallery -- upload <job-slug> <folder-with-images>\n  npm run gallery -- delete <job-slug>\n\n"import" opens Google Drive Picker so you can select existing Drive photos without copying them.\nJob slugs use lowercase letters, numbers, and hyphens, for example: wedding-2026.`);
+  console.log(`Usage:\n  npm run gallery -- import <job-slug>\n  npm run gallery -- edit <job-slug>\n  npm run gallery -- upload <job-slug> <folder-with-images>\n  npm run gallery -- delete <job-slug>\n\n"import" opens Google Drive Picker so you can select existing Drive photos without copying them.\n"edit" lets you remove listed photos and/or add more Drive photos to a Picker-linked gallery.\nJob slugs use lowercase letters, numbers, and hyphens, for example: wedding-2026.`);
 }
 if (!command || command === "--help" || command === "help") { help(); process.exit(0); }
-if (!["import", "upload", "delete"].includes(command) || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug || "")) {
+if (!["import", "edit", "upload", "delete"].includes(command) || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug || "")) {
   help(); process.exit(2);
 }
 
@@ -34,54 +34,21 @@ auth.setCredentials({ refresh_token: refreshToken });
 const drive = google.drive({ version: "v3", auth });
 
 if (command === "import") await importGallery(slug);
+else if (command === "edit") await editGallery(slug);
 else if (command === "upload") await uploadGallery(slug, directory);
 else await deleteGallery(slug);
 
 async function importGallery(jobSlug) {
   if (await findGallery(jobSlug)) throw new Error(`Gallery ${jobSlug} already exists. Delete it first if you intend to replace it.`);
-  const redirectUri = "http://localhost:53682/oauth2callback";
-  const pickerAuth = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
-  const authUrl = pickerAuth.generateAuthUrl({
-    access_type: "offline",
-    prompt: "consent",
-    scope: ["https://www.googleapis.com/auth/drive.file"],
-    trigger_onepick: "true",
-    allow_multiple: "true"
-  });
-  const result = await waitForDrivePicker(redirectUri, authUrl);
-  const tokens = (await pickerAuth.getToken(result.code)).tokens;
-  pickerAuth.setCredentials(tokens);
-  const pickerDrive = google.drive({ version: "v3", auth: pickerAuth });
+  const { files, pickerDrive, tokens } = await pickDriveFilesInBatches();
   const existing = await pickerDrive.files.list({
     q: `mimeType = 'application/vnd.google-apps.folder' and trashed = false and appProperties has { key='clientGallerySlug' and value='${jobSlug}' }`,
     pageSize: 1,
     fields: "files(id,name)"
   });
   if (existing.data.files?.length) throw new Error(`Gallery ${jobSlug} already exists. Delete it first if you intend to replace it.`);
-  const files = [];
-  for (const fileId of [...new Set(result.pickedFileIds)]) {
-    const { data: file } = await pickerDrive.files.get({
-      fileId,
-      supportsAllDrives: true,
-      fields: "id,name,mimeType,size,trashed,driveId,imageMediaMetadata(width,height)"
-    });
-    if (file.trashed || !["image/jpeg", "image/png", "image/webp", "image/avif", "image/gif"].includes(file.mimeType)) {
-      throw new Error(`“${file.name}” is not an active supported photo. Pick JPG, PNG, WebP, AVIF, or GIF images only.`);
-    }
-    files.push(file);
-  }
-  if (!files.length) throw new Error("No photos were selected. Open the Drive folder, select the images, and confirm the selection.");
-  const usedNames = new Set();
-  for (const file of files) {
-    const dot = file.name.lastIndexOf(".");
-    const stem = dot > 0 ? file.name.slice(0, dot) : file.name;
-    const extension = dot > 0 ? file.name.slice(dot) : "";
-    let candidate = file.name;
-    let duplicate = 2;
-    while (usedNames.has(candidate.toLocaleLowerCase())) candidate = `${stem} (${duplicate++})${extension}`;
-    usedNames.add(candidate.toLocaleLowerCase());
-    file.galleryName = candidate;
-  }
+  if (!files.length) throw new Error("No supported photos were selected.");
+  assignUniqueGalleryNames(files);
   const totalBytes = files.reduce((sum, file) => sum + BigInt(file.size || 0), 0n);
   if (totalBytes > BigInt(MAX_BYTES)) throw new Error(`This gallery is ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB. The configured per-job limit is 10 GiB.`);
 
@@ -93,14 +60,7 @@ async function importGallery(jobSlug) {
   const folderId = createdFolder.data.id;
   let manifestId;
   try {
-    const manifest = files.map(file => ({
-      id: file.id,
-      name: file.galleryName,
-      mimeType: file.mimeType,
-      size: file.size || "0",
-      width: file.imageMediaMetadata?.width || null,
-      height: file.imageMediaMetadata?.height || null
-    }));
+    const manifest = files.map(manifestEntry);
     const manifestFile = await pickerDrive.files.create({
       requestBody: { name: "gallery-manifest.json", mimeType: "application/json", parents: [folderId] },
       media: { mimeType: "application/json", body: JSON.stringify(manifest) },
@@ -121,17 +81,194 @@ async function importGallery(jobSlug) {
     await pickerDrive.files.delete({ fileId: folderId }).catch(() => {});
     throw error;
   }
-  console.log(`\nClient gallery: https://www.carrels.photography/client-gallery/?slug=${jobSlug}`);
+  printGalleryLink(jobSlug);
   console.log(`${files.length} selected photos were linked without copying them`);
   console.log(`Password (copy it now; it is not saved in this repo): ${password}`);
   console.log(`${files.length} photos · ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB`);
+  printRefreshTokenNotice(tokens);
+}
+
+async function pickDriveFilesInBatches(existingFiles = []) {
+  const files = [];
+  const selectedIds = new Set(existingFiles.map(file => file.id));
+  let pickerDrive;
+  let tokens;
+  let newlyIssuedRefreshToken;
+  let batchNumber = 1;
+  let totalBytes = existingFiles.reduce((sum, file) => sum + BigInt(file.size || 0), 0n);
+
+  do {
+    const result = await pickDriveFiles(batchNumber);
+    pickerDrive = result.pickerDrive;
+    tokens = result.tokens;
+    if (result.tokens.refresh_token && result.tokens.refresh_token !== refreshToken) newlyIssuedRefreshToken = result.tokens.refresh_token;
+    const batchFiles = result.files.filter(file => !selectedIds.has(file.id));
+    for (const file of batchFiles) selectedIds.add(file.id);
+    const batchBytes = batchFiles.reduce((sum, file) => sum + BigInt(file.size || 0), 0n);
+    totalBytes += batchBytes;
+    if (totalBytes > BigInt(MAX_BYTES)) {
+      throw new Error(`This gallery would exceed the 10 GiB limit (${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB). No manifest changes were saved.`);
+    }
+    files.push(...batchFiles);
+    console.log(`Batch ${batchNumber}: added ${batchFiles.length} new photo(s); ${files.length} photo(s) selected in this edit · ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB total.`);
+    batchNumber++;
+  } while (await askYesNo("Select another batch of photos? (y/N): "));
+
+  if (newlyIssuedRefreshToken) tokens = { ...tokens, refresh_token: newlyIssuedRefreshToken };
+  return { files, pickerDrive, tokens };
+}
+
+async function pickDriveFiles(batchNumber = 1) {
+  const redirectUri = "http://localhost:53682/oauth2callback";
+  const pickerAuth = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  const authUrl = pickerAuth.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: ["https://www.googleapis.com/auth/drive.file"],
+    trigger_onepick: "true",
+    allow_multiple: "true",
+    mimetypes: "image/jpeg,image/png,image/webp,image/avif,image/gif"
+  });
+  const result = await waitForDrivePicker(redirectUri, authUrl, batchNumber);
+  const tokens = (await pickerAuth.getToken(result.code)).tokens;
+  pickerAuth.setCredentials(tokens);
+  const pickerDrive = google.drive({ version: "v3", auth: pickerAuth });
+  const files = [];
+  for (const fileId of [...new Set(result.pickedFileIds)]) {
+    const { data: file } = await pickerDrive.files.get({
+      fileId,
+      supportsAllDrives: true,
+      fields: "id,name,mimeType,size,trashed,driveId,imageMediaMetadata(width,height)"
+    });
+    if (file.trashed || !["image/jpeg", "image/png", "image/webp", "image/avif", "image/gif"].includes(file.mimeType)) {
+      throw new Error(`“${file.name}” is not an active supported photo. Pick JPG, PNG, WebP, AVIF, or GIF images only.`);
+    }
+    files.push(file);
+  }
+  return { files, pickerDrive, tokens };
+}
+
+async function askYesNo(question) {
+  const rl = createInterface({ input: stdin, output: stdout });
+  try { return /^y(es)?$/i.test((await rl.question(question)).trim()); }
+  finally { rl.close(); }
+}
+
+function manifestEntry(file) {
+  return {
+    id: file.id,
+    name: file.galleryName || file.name,
+    mimeType: file.mimeType,
+    size: file.size || "0",
+    width: file.imageMediaMetadata?.width || null,
+    height: file.imageMediaMetadata?.height || null
+  };
+}
+
+function assignUniqueGalleryNames(files, existingNames = []) {
+  const usedNames = new Set(existingNames.map(name => name.toLocaleLowerCase()));
+  for (const file of files) {
+    const dot = file.name.lastIndexOf(".");
+    const stem = dot > 0 ? file.name.slice(0, dot) : file.name;
+    const extension = dot > 0 ? file.name.slice(dot) : "";
+    let candidate = file.name;
+    let duplicate = 2;
+    while (usedNames.has(candidate.toLocaleLowerCase())) candidate = `${stem} (${duplicate++})${extension}`;
+    usedNames.add(candidate.toLocaleLowerCase());
+    file.galleryName = candidate;
+  }
+}
+
+async function editGallery(jobSlug) {
+  const gallery = await findGallery(jobSlug);
+  if (!gallery) throw new Error(`Gallery ${jobSlug} was not found in the connected Google Drive.`);
+  const props = gallery.appProperties || {};
+  const manifestId = props.clientGalleryManifestId;
+  if (!manifestId || props.clientGallerySource !== "picked-files") {
+    throw new Error("Editing is currently available for galleries created with the Drive Picker import command.");
+  }
+  let manifest = await readDriveManifest(manifestId);
+  if (!manifest.length) throw new Error("This gallery's photo list is empty or invalid.");
+  console.log(`\nPhotos in ${props.clientGalleryTitle || gallery.name}:`);
+  manifest.forEach((file, index) => console.log(`  ${index + 1}. ${file.name}`));
+
+  const rl = createInterface({ input: stdin, output: stdout });
+  let removeAnswer;
+  let addAnswer;
+  try {
+    removeAnswer = await rl.question("Remove photo numbers (for example 2,4-6), or press Enter to keep all: ");
+    addAnswer = await rl.question("Add photos from Google Drive Picker? (y/N): ");
+  } finally { rl.close(); }
+
+  const removeIndexes = parsePhotoIndexes(removeAnswer, manifest.length);
+  let updated = manifest.filter((_, index) => !removeIndexes.has(index));
+  let pickedFiles = [];
+  let pickerDrive = null;
+  let tokens = null;
+  if (/^y(es)?$/i.test(addAnswer.trim())) {
+    ({ files: pickedFiles, pickerDrive, tokens } = await pickDriveFilesInBatches(updated));
+    const existingIds = new Set(updated.map(file => file.id));
+    assignUniqueGalleryNames(pickedFiles, updated.map(file => file.name));
+    updated = [...updated, ...pickedFiles.map(manifestEntry)];
+  }
+  if (removeIndexes.size === 0 && pickedFiles.length === 0) throw new Error("No gallery changes were selected.");
+  if (!updated.length) throw new Error("A gallery must contain at least one photo; nothing was changed.");
+  const totalBytes = updated.reduce((sum, file) => sum + BigInt(file.size || 0), 0n);
+  if (totalBytes > BigInt(MAX_BYTES)) throw new Error(`This gallery would be ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB. The configured per-job limit is 10 GiB; nothing was changed.`);
+
+  await writeDriveManifest(manifestId, updated, pickerDrive || drive);
+  console.log(`\nUpdated ${jobSlug}: removed ${removeIndexes.size}, added ${pickedFiles.length}, now ${updated.length} photos · ${(Number(totalBytes) / 1024 ** 3).toFixed(2)} GiB.`);
+  if (removeIndexes.size) console.log("Removed photos are unlinked from the gallery; the original files remain in Google Drive.");
+  printGalleryLink(jobSlug);
+  if (tokens) printRefreshTokenNotice(tokens);
+}
+
+function parsePhotoIndexes(value, count) {
+  const selected = new Set();
+  const input = value.trim();
+  if (!input) return selected;
+  for (const part of input.split(",").map(item => item.trim())) {
+    const match = part.match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    if (!match) throw new Error(`Invalid photo selection “${part}”. Use numbers such as 2,4-6.`);
+    const start = Number(match[1]);
+    const end = Number(match[2] || match[1]);
+    if (start < 1 || end < start || end > count) throw new Error(`Photo selection “${part}” is outside the listed range 1-${count}.`);
+    for (let index = start - 1; index < end; index++) selected.add(index);
+  }
+  return selected;
+}
+
+async function readDriveManifest(manifestId) {
+  const { token } = await auth.getAccessToken();
+  const response = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(manifestId)}?alt=media`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!response.ok) throw new Error(`Could not read the gallery photo list (${response.status}).`);
+  const manifest = await response.json();
+  if (!Array.isArray(manifest)) throw new Error("This gallery's photo list is invalid.");
+  return manifest.filter(file => typeof file.id === "string" && typeof file.name === "string");
+}
+
+async function writeDriveManifest(manifestId, manifest, driveClient) {
+  await driveClient.files.update({
+    fileId: manifestId,
+    media: { mimeType: "application/json", body: JSON.stringify(manifest) },
+    fields: "id"
+  });
+}
+
+function printGalleryLink(jobSlug) {
+  console.log(`\nClient gallery: https://www.carrels.photography/client-gallery/?slug=${jobSlug}`);
+}
+
+function printRefreshTokenNotice(tokens) {
   if (tokens.refresh_token && tokens.refresh_token !== refreshToken) {
     console.log("Google issued a new refresh token. Update GOOGLE_REFRESH_TOKEN in your private .env and Render environment settings if deployed.");
     console.log(tokens.refresh_token);
   }
 }
 
-function waitForDrivePicker(redirectUri, authUrl) {
+function waitForDrivePicker(redirectUri, authUrl, batchNumber = 1) {
   return new Promise((resolve, reject) => {
     const rl = createInterface({ input: stdin, output: stdout });
     const server = createServer((request, response) => {
@@ -157,7 +294,9 @@ function waitForDrivePicker(redirectUri, authUrl) {
     });
     server.once("error", error => { rl.close(); reject(error); });
     server.listen(53682, "127.0.0.1", () => {
-      console.log("Google Drive Picker will open in your browser. Open the client folder, then select all photos for this gallery.");
+      console.log(`Google Drive Picker batch ${batchNumber} will open. Open the client folder; supported image files are filtered and multi-select is enabled.`);
+    if (batchNumber > 1) console.log("Select the next set of photos; files included in earlier batches are automatically skipped.");
+      console.log("On Mac, try Command+A to select all visible photos at once, then confirm the selection.");
       console.log(`\n${authUrl}\n`);
       console.log("If it does not open automatically, copy the URL above into your browser. Waiting for selection…");
     });
