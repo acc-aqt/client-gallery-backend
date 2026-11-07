@@ -81,6 +81,14 @@ npm run gallery -- refresh-previews wedding-2026
 
 This adds compressed WebP previews in the app-managed Drive folder and updates the gallery manifest. It does not change the original photos.
 
+The **Download all (low-res)** button bundles the gallery's selected Drive photos into a ZIP. To provide a high-resolution download without building a large archive on the backend, upload one `.tar.gz` archive to Drive and attach it to the gallery:
+
+```sh
+npm run gallery -- attach-highres wedding-2026
+```
+
+Google Drive Picker opens without a file-type filter; select exactly one `.tar.gz` file. The gallery then streams that archive to clients through the password-protected backend. Replacing the attached archive only changes the gallery link; it leaves the previous archive in Drive. Delete it there when it is no longer needed.
+
 To upload a local folder of final images into Drive instead:
 
 ```sh

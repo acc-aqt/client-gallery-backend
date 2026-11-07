@@ -18,12 +18,13 @@ async function handleRequest(request, env) {
     const apiMatch = path.match(/^\/api\/gallery\/([a-z0-9][a-z0-9-]{0,62})$/);
     const imageMatch = path.match(/^\/(image|thumb)\/([a-z0-9][a-z0-9-]{0,62})\/([\w-]+)$/);
     const downloadMatch = path.match(/^\/download-all\/([a-z0-9][a-z0-9-]{0,62})$/);
+    const highResDownloadMatch = path.match(/^\/download-highres\/([a-z0-9][a-z0-9-]{0,62})$/);
     const loginMatch = path.match(/^\/login\/([a-z0-9][a-z0-9-]{0,62})$/);
 
     if (request.method === "POST" && loginMatch) return login(request, env, loginMatch[1]);
     if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed", { status: 405 });
 
-    const slug = apiMatch?.[1] || imageMatch?.[2] || downloadMatch?.[1];
+    const slug = apiMatch?.[1] || imageMatch?.[2] || downloadMatch?.[1] || highResDownloadMatch?.[1];
     if (!slug) return new Response("Not found", { status: 404 });
 
     const session = await readSession(request, env, slug, url.searchParams.get("token"));
@@ -31,7 +32,8 @@ async function handleRequest(request, env) {
 
     if (apiMatch) {
       const images = await listImages(env, session.folderId, session.manifestId);
-      return json({ title: session.title, images: images.map(file => ({
+      const highResArchiveId = await getHighResArchiveId(env, session.folderId);
+      return json({ title: session.title, hasHighResArchive: Boolean(highResArchiveId), images: images.map(file => ({
         id: file.id,
         name: file.galleryPath || file.name,
         width: file.imageMediaMetadata?.width || null,
@@ -42,6 +44,7 @@ async function handleRequest(request, env) {
     }
     if (imageMatch) return serveImage(env, session, imageMatch[1], imageMatch[3]);
     if (downloadMatch) return downloadAll(env, session, slug);
+    if (highResDownloadMatch) return downloadHighResArchive(env, session, slug);
     return new Response("Not found", { status: 404 });
   } catch (error) {
     console.error("Client gallery request failed:", error);
@@ -184,6 +187,14 @@ async function findGallery(env, slug) {
   };
 }
 
+async function getHighResArchiveId(env, folderId) {
+  const folder = await driveJson(env, `files/${encodeURIComponent(folderId)}`, {
+    params: { fields: "appProperties", supportsAllDrives: "true" }
+  });
+  const archiveId = folder.appProperties?.clientGalleryHighResArchiveId;
+  return typeof archiveId === "string" && /^[\w-]{10,200}$/.test(archiveId) ? archiveId : null;
+}
+
 async function listImages(env, folderId, manifestId = null) {
   if (manifestId) {
     const manifest = await readManifest(env, manifestId);
@@ -192,9 +203,6 @@ async function listImages(env, folderId, manifestId = null) {
       name: file.name,
       mimeType: file.mimeType,
       size: file.size,
-      previewId: file.previewId || null,
-      previewMimeType: file.previewMimeType || null,
-      previewSize: file.previewSize || null,
       imageMediaMetadata: file.width && file.height ? { width: file.width, height: file.height } : null
     }));
   }
@@ -256,12 +264,7 @@ async function getCheckedImage(env, folderId, fileId, manifestId = null) {
   if (!isDisplayImage(file)) return null;
   if (manifestEntry && file.mimeType !== manifestEntry.mimeType) return null;
   if (!manifestEntry && !(await isGalleryDescendant(env, file.parents || [], folderId))) return null;
-  if (manifestEntry) {
-    file.name = manifestEntry.name;
-    file.previewId = manifestEntry.previewId || null;
-    file.previewMimeType = manifestEntry.previewMimeType || null;
-    file.previewSize = manifestEntry.previewSize || null;
-  }
+  if (manifestEntry) file.name = manifestEntry.name;
   return file;
 }
 
@@ -285,21 +288,6 @@ async function isGalleryDescendant(env, initialParents, folderId) {
 async function serveImage(env, session, type, fileId) {
   const file = await getCheckedImage(env, session.folderId, fileId, session.manifestId);
   if (!file) return new Response("Not found", { status: 404, headers: noStore() });
-  if (type === "thumb" && file.previewId && /^[\w-]{10,200}$/.test(file.previewId)) {
-    const preview = await driveRequest(env, `files/${encodeURIComponent(file.previewId)}`, { params: { alt: "media", supportsAllDrives: "true" } });
-    if (preview.ok && preview.body) {
-      const headers = { ...noStore(), "Content-Type": file.previewMimeType === "image/webp" ? "image/webp" : "image/jpeg" };
-      if (file.previewSize) headers["Content-Length"] = file.previewSize;
-      return new Response(preview.body, { headers });
-    }
-  }
-  if (type === "thumb" && file.thumbnailLink) {
-    const token = await getAccessToken(env);
-    const thumb = await fetch(file.thumbnailLink, { headers: { Authorization: `Bearer ${token}` }, redirect: "follow" });
-    if (thumb.ok && thumb.body) {
-      return new Response(thumb.body, { headers: { ...noStore(), "Content-Type": thumb.headers.get("Content-Type") || "image/jpeg" } });
-    }
-  }
   const response = await driveRequest(env, `files/${encodeURIComponent(fileId)}`, { params: { alt: "media", supportsAllDrives: "true" } });
   if (!response.ok || !response.body) return new Response("Photo unavailable", { status: response.status || 502, headers: noStore() });
   const headers = { ...noStore(), "Content-Type": file.mimeType };
@@ -435,6 +423,27 @@ async function downloadAll(env, session, slug) {
     } catch (error) { if (!isCancelled) { try { outputController.error(error); } catch {} } }
   })();
   return new Response(stream, { headers: { ...noStore(), "Content-Type": "application/zip", "Content-Disposition": `attachment; filename="${slug}.zip"` } });
+}
+
+async function downloadHighResArchive(env, session, slug) {
+  const archiveId = await getHighResArchiveId(env, session.folderId);
+  if (!archiveId) return new Response("No high-res archive is configured for this gallery.", { status: 404, headers: noStore() });
+  const archive = await driveJson(env, `files/${encodeURIComponent(archiveId)}`, {
+    params: { fields: "id,name,mimeType,size,trashed", supportsAllDrives: "true" }
+  });
+  if (archive.trashed || !String(archive.name || "").toLowerCase().endsWith(".tar.gz")) {
+    return new Response("The high-res archive is unavailable.", { status: 404, headers: noStore() });
+  }
+  const response = await driveRequest(env, `files/${encodeURIComponent(archiveId)}`, { params: { alt: "media", supportsAllDrives: "true" } });
+  if (!response.ok || !response.body) return new Response("Google Drive could not provide the high-res archive.", { status: response.status || 502, headers: noStore() });
+  const headers = {
+    ...noStore(),
+    "Content-Type": "application/gzip",
+    "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(archive.name)}`,
+    "X-Content-Type-Options": "nosniff"
+  };
+  if (archive.size) headers["Content-Length"] = archive.size;
+  return new Response(response.body, { headers });
 }
 
 const styles = `:root{--page-x:10px;--header-h:60px;--text:#6c5d53;--hover:#ccc3bd;--bg:#fff;--gap:5px}*{box-sizing:border-box}html{min-height:100%;overflow-x:hidden}body{min-height:100vh;margin:0;padding:60px var(--page-x) 0;font-family:Poppins,Arial,sans-serif;font-size:15px;font-weight:400;line-height:1.4;color:var(--text);background:var(--bg);-webkit-font-smoothing:antialiased}a,button{color:inherit;text-decoration:none;transition:color .2s ease,opacity .2s ease}a:hover,button:hover{color:var(--hover)}button{font:inherit;cursor:pointer}header{position:fixed;top:0;left:var(--page-x);right:var(--page-x);height:var(--header-h);z-index:10;background:var(--bg);display:flex;align-items:center;justify-content:space-between;padding:0 15px}.brand{font-family:Allura,cursive;font-size:31px;color:var(--text)}nav{display:flex;align-items:center;gap:30px;font-size:13px}nav form{margin:0}nav button{background:none;border:0;padding:0}.portfolio-heading{text-align:center;padding:20px 20px 20px}.eyebrow{font-size:10px;letter-spacing:2px;text-transform:uppercase;opacity:.65;margin:0 0 4px}.portfolio-heading h1{font-size:28px;letter-spacing:2px;font-weight:400;margin:0 0 8px;line-height:1.3}.portfolio-heading>p:not(.eyebrow){font-size:13px;letter-spacing:1px;opacity:.7;margin:0}.download-all{display:inline-flex;gap:10px;align-items:center;margin-top:17px;padding:10px 17px;border:1px solid #c9c1ba;font-size:12px;letter-spacing:.4px}.download-all:hover{background:#f4f1ee;color:var(--text)}.main-section{position:relative;overflow:visible;margin:0}.photo-grid{column-count:5;column-gap:var(--gap)}.photo{display:block;width:100%;padding:0;margin:0 0 var(--gap);border:0;background:none;line-height:0;overflow:hidden;break-inside:avoid}.photo img{display:block;width:100%;height:auto;object-fit:cover;background:#f3f1ef}.photo:hover img{opacity:.88}.photo:focus-visible,.download-all:focus-visible{outline:2px solid #6c5d53;outline-offset:2px}.empty{text-align:center;padding:60px 0}.login{width:min(420px,calc(100% - 32px));margin:10vh auto}.login .eyebrow{margin-bottom:12px}.login h1{font-weight:400;font-size:30px;line-height:1.2;letter-spacing:1px;margin:0 0 8px}.description{font-size:13px;opacity:.75;margin:0 0 24px}.login form{display:grid;gap:10px}.login label{font-size:12px;letter-spacing:.5px}.login input{font:inherit;padding:12px;border:1px solid #c9c1ba;color:var(--text);background:white}.login form button{justify-self:start;background:#6c5d53;color:white;border:0;padding:13px 20px;margin-top:5px;font-size:12px;letter-spacing:.5px}.login form button:hover{background:#88796f;color:white}.error{font-size:13px;color:#9b3324;margin:0 0 15px}dialog{position:fixed;inset:0;width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:54px 62px 72px;background:rgba(0,0,0,.96);border:0;color:#fff}dialog::backdrop{background:rgba(0,0,0,.92)}dialog img{display:block;max-width:100%;max-height:calc(100vh - 142px);width:auto;height:auto;object-fit:contain;margin:auto}.close,.prev,.next{position:absolute;border:0;background:none;color:#fff;cursor:pointer;font:38px/1 Arial,sans-serif}.close{top:12px;right:22px;font-size:42px}.prev{left:19px;top:47%}.next{right:19px;top:47%}.view-caption{position:absolute;bottom:18px;left:0;right:0;display:flex;justify-content:center;align-items:center;gap:26px;font-size:12px;color:#d3ccc7}.single-download{color:#eee;text-decoration:underline}.single-download:hover{color:#ccc}.view-caption .counter{min-width:45px;text-align:right}@media(max-width:1200px){.photo-grid{column-count:4}}@media(max-width:900px){.photo-grid{column-count:3}}@media(max-width:600px){body{padding-top:60px}header{left:0;right:0;padding:0 15px}nav{gap:14px;font-size:12px}.brand{font-size:27px}.photo-grid{column-count:2}.portfolio-heading{padding:10px 0 14px}.portfolio-heading h1{font-size:24px;letter-spacing:1.5px}.portfolio-heading>p:not(.eyebrow){font-size:12px}}@media(max-width:420px){.photo-grid{column-count:1}nav{gap:10px}.portfolio-heading h1{font-size:22px}}`;

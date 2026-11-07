@@ -16,10 +16,10 @@ const args = process.argv.slice(2);
 const [command, slug, directory] = args;
 
 function help() {
-  console.log(`Usage:\n  npm run gallery -- import <job-slug>\n  npm run gallery -- edit <job-slug>\n  npm run gallery -- refresh-previews <job-slug>\n  npm run gallery -- upload <job-slug> <folder-with-images>\n  npm run gallery -- delete <job-slug>\n\n"import" opens Google Drive Picker so you can select existing Drive photos without copying them.\n"edit" lets you remove listed photos and/or add more Drive photos to a Picker-linked gallery.\n"refresh-previews" creates sharper, compressed gallery previews for an existing Picker-linked gallery.\nJob slugs use lowercase letters, numbers, and hyphens, for example: wedding-2026.`);
+  console.log(`Usage:\n  npm run gallery -- import <job-slug>\n  npm run gallery -- edit <job-slug>\n  npm run gallery -- refresh-previews <job-slug>\n  npm run gallery -- attach-highres <job-slug>\n  npm run gallery -- upload <job-slug> <folder-with-images>\n  npm run gallery -- delete <job-slug>\n\n"import" opens Google Drive Picker so you can select existing Drive photos without copying them.\n"edit" lets you remove listed photos and/or add more Drive photos to a Picker-linked gallery.\n"refresh-previews" creates sharper, compressed gallery previews for an existing Picker-linked gallery.\n"attach-highres" links one .tar.gz archive already stored in Drive to a gallery.\nJob slugs use lowercase letters, numbers, and hyphens, for example: wedding-2026.`);
 }
 if (!command || command === "--help" || command === "help") { help(); process.exit(0); }
-if (!["import", "edit", "refresh-previews", "upload", "delete"].includes(command) || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug || "")) {
+if (!["import", "edit", "refresh-previews", "attach-highres", "upload", "delete"].includes(command) || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug || "")) {
   help(); process.exit(2);
 }
 
@@ -37,8 +37,59 @@ const drive = google.drive({ version: "v3", auth });
 if (command === "import") await importGallery(slug);
 else if (command === "edit") await editGallery(slug);
 else if (command === "refresh-previews") await refreshGalleryPreviews(slug);
+else if (command === "attach-highres") await attachHighResArchive(slug);
 else if (command === "upload") await uploadGallery(slug, directory);
 else await deleteGallery(slug);
+
+async function attachHighResArchive(jobSlug) {
+  const gallery = await findGallery(jobSlug);
+  if (!gallery) throw new Error(`Gallery ${jobSlug} was not found in the connected Google Drive.`);
+  const { file, pickerDrive, tokens } = await pickHighResArchive();
+  const manifestId = gallery.appProperties?.clientGalleryManifestId;
+  const existingBytes = manifestId
+    ? (await readDriveManifest(manifestId)).reduce((sum, image) => sum + BigInt(image.size || 0) + BigInt(image.previewSize || 0), 0n)
+    : 0n;
+  if (existingBytes + BigInt(file.size || 0) > BigInt(MAX_BYTES)) {
+    throw new Error(`Gallery photos and the high-res archive would exceed the 10 GiB per-job limit. Nothing was attached.`);
+  }
+  await pickerDrive.files.update({
+    fileId: gallery.id,
+    requestBody: { appProperties: {
+      ...(gallery.appProperties || {}),
+      clientGalleryHighResArchiveId: file.id
+    } },
+    fields: "id,appProperties"
+  });
+  console.log(`Attached ${file.name} to ${jobSlug}; the gallery will stream this archive directly to clients.`);
+  printGalleryLink(jobSlug);
+  printRefreshTokenNotice(tokens);
+}
+
+async function pickHighResArchive() {
+  const redirectUri = "http://localhost:53682/oauth2callback";
+  const pickerAuth = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  const authUrl = pickerAuth.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: ["https://www.googleapis.com/auth/drive.file"],
+    trigger_onepick: "true",
+    allow_multiple: "false"
+  });
+  const result = await waitForDrivePicker(redirectUri, authUrl, 1, "single .tar.gz archive");
+  if (result.pickedFileIds.length !== 1) throw new Error("Select exactly one .tar.gz archive.");
+  const tokens = (await pickerAuth.getToken(result.code)).tokens;
+  pickerAuth.setCredentials(tokens);
+  const pickerDrive = google.drive({ version: "v3", auth: pickerAuth });
+  const { data: file } = await pickerDrive.files.get({
+    fileId: result.pickedFileIds[0],
+    supportsAllDrives: true,
+    fields: "id,name,mimeType,size,trashed"
+  });
+  if (file.trashed || !file.name?.toLowerCase().endsWith(".tar.gz") || !file.mimeType?.startsWith("application/") || file.mimeType.startsWith("application/vnd.google-apps.")) {
+    throw new Error(`“${file.name}” is not a supported .tar.gz archive.`);
+  }
+  return { file, pickerDrive, tokens };
+}
 
 async function importGallery(jobSlug) {
   if (await findGallery(jobSlug)) throw new Error(`Gallery ${jobSlug} already exists. Delete it first if you intend to replace it.`);
@@ -372,7 +423,7 @@ function printRefreshTokenNotice(tokens) {
   }
 }
 
-function waitForDrivePicker(redirectUri, authUrl, batchNumber = 1) {
+function waitForDrivePicker(redirectUri, authUrl, batchNumber = 1, selectionLabel = "photos") {
   return new Promise((resolve, reject) => {
     const rl = createInterface({ input: stdin, output: stdout });
     const server = createServer((request, response) => {
@@ -385,10 +436,10 @@ function waitForDrivePicker(redirectUri, authUrl, batchNumber = 1) {
       const code = url.searchParams.get("code");
       const pickedFileIds = (url.searchParams.get("picked_file_ids") || "").split(",").filter(Boolean);
       if (error || !code || pickedFileIds.length < 1) {
-        response.writeHead(400, { "Content-Type": "text/html; charset=utf-8" }).end("<p>No photos were selected. Return to your terminal, open the Drive folder, and select the photos.</p>");
+        response.writeHead(400, { "Content-Type": "text/html; charset=utf-8" }).end("<p>No files were selected. Return to your terminal and select the requested file.</p>");
         server.close();
         rl.close();
-        reject(new Error(error ? `Google Drive authorization failed: ${error}` : "No photos were selected. Open the Drive folder, select the photos, and confirm the selection."));
+        reject(new Error(error ? `Google Drive authorization failed: ${error}` : "No files were selected. Open Drive Picker and confirm your selection."));
         return;
       }
       response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end("<p>Drive folder selected. Return to your terminal.</p>");
@@ -398,9 +449,12 @@ function waitForDrivePicker(redirectUri, authUrl, batchNumber = 1) {
     });
     server.once("error", error => { rl.close(); reject(error); });
     server.listen(53682, "127.0.0.1", () => {
-      console.log(`Google Drive Picker batch ${batchNumber} will open. Open the client folder; supported image files are filtered and multi-select is enabled.`);
-    if (batchNumber > 1) console.log("Select the next set of photos; files included in earlier batches are automatically skipped.");
-      console.log("On Mac, try Command+A to select all visible photos at once, then confirm the selection.");
+      console.log(`Google Drive Picker batch ${batchNumber} will open. Select ${selectionLabel}.`);
+      if (selectionLabel === "photos") {
+        console.log("Open the client folder; supported image files are filtered and multi-select is enabled.");
+        if (batchNumber > 1) console.log("Select the next set of photos; files included in earlier batches are automatically skipped.");
+        console.log("On Mac, try Command+A to select all visible photos at once, then confirm the selection.");
+      }
       console.log(`\n${authUrl}\n`);
       console.log("If it does not open automatically, copy the URL above into your browser. Waiting for selection…");
     });
